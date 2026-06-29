@@ -77,12 +77,7 @@ public static class AmprExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        var buffer = 0UL;
-        var size = 0UL;
-        _ = ctx.TryReadUInt64(commandBuffer + CommandBufferDataOffset, out buffer);
-        _ = ctx.TryReadUInt64(commandBuffer + CommandBufferSizeOffset, out size);
-
-        if (!InitializeCommandBuffer(ctx, commandBuffer, buffer, size, aux0, aux1, clear: false))
+        if (!InitializeCommandBuffer(ctx, commandBuffer, buffer: 0, size: 0, aux0, aux1, clear: false))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -106,8 +101,9 @@ public static class AmprExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        if (!ctx.TryWriteUInt64(commandBuffer + CommandBufferAux0Offset, 0) ||
-            !ctx.TryWriteUInt64(commandBuffer + CommandBufferAux1Offset, 0))
+        Span<byte> auxiliaryPointers = stackalloc byte[sizeof(ulong) * 2];
+        auxiliaryPointers.Clear();
+        if (!ctx.Memory.TryWrite(commandBuffer + CommandBufferAux0Offset, auxiliaryPointers))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -181,8 +177,15 @@ public static class AmprExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!ctx.TryReadUInt64(commandBuffer + CommandBufferDataOffset, out var buffer) ||
-            !ctx.TryReadUInt64(commandBuffer + CommandBufferSizeOffset, out var size) ||
+        Span<byte> bufferPointers = stackalloc byte[sizeof(ulong) * 2];
+        if (!ctx.Memory.TryRead(commandBuffer + CommandBufferDataOffset, bufferPointers))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var buffer = BinaryPrimitives.ReadUInt64LittleEndian(bufferPointers);
+        var size = BinaryPrimitives.ReadUInt64LittleEndian(bufferPointers[sizeof(ulong)..]);
+        if (
             !WriteCommandBufferPointers(ctx, commandBuffer, buffer, size, writeOffset: 0))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -476,20 +479,34 @@ public static class AmprExports
         ulong aux1,
         bool clear)
     {
+        Span<byte> header = stackalloc byte[CommandBufferHeaderSize];
         if (clear)
         {
-            Span<byte> header = stackalloc byte[CommandBufferHeaderSize];
             header.Clear();
-            if (!ctx.Memory.TryWrite(commandBuffer, header))
+        }
+        else
+        {
+            if (!ctx.Memory.TryRead(commandBuffer, header))
             {
                 return false;
             }
+
+            buffer = BinaryPrimitives.ReadUInt64LittleEndian(header[(int)CommandBufferDataOffset..]);
+            size = BinaryPrimitives.ReadUInt64LittleEndian(header[(int)CommandBufferSizeOffset..]);
         }
 
-        return ctx.TryWriteUInt64(commandBuffer + CommandBufferSelfOffset, commandBuffer) &&
-               ctx.TryWriteUInt64(commandBuffer + CommandBufferAux0Offset, aux0) &&
-               ctx.TryWriteUInt64(commandBuffer + CommandBufferAux1Offset, aux1) &&
-               WriteCommandBufferPointers(ctx, commandBuffer, buffer, size, writeOffset: 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[(int)CommandBufferSelfOffset..], commandBuffer);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[(int)CommandBufferDataOffset..], buffer);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[(int)CommandBufferSizeOffset..], size);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[(int)CommandBufferAux0Offset..], aux0);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[(int)CommandBufferAux1Offset..], aux1);
+        if (!ctx.Memory.TryWrite(commandBuffer, header))
+        {
+            return false;
+        }
+
+        UpdateCommandBufferState(commandBuffer, buffer, size, writeOffset: 0);
+        return true;
     }
 
     private static bool WriteCommandBufferPointers(CpuContext ctx, ulong commandBuffer, ulong buffer, ulong size)
@@ -504,6 +521,26 @@ public static class AmprExports
             return false;
         }
 
+        UpdateCommandBufferState(commandBuffer, buffer, size, writeOffset);
+
+        return true;
+    }
+
+    private static bool WriteVisibleCommandBufferPointers(CpuContext ctx, ulong commandBuffer, ulong buffer, ulong size)
+    {
+        Span<byte> pointers = stackalloc byte[sizeof(ulong) * 3];
+        BinaryPrimitives.WriteUInt64LittleEndian(pointers, commandBuffer);
+        BinaryPrimitives.WriteUInt64LittleEndian(pointers[sizeof(ulong)..], buffer);
+        BinaryPrimitives.WriteUInt64LittleEndian(pointers[(sizeof(ulong) * 2)..], size);
+        return ctx.Memory.TryWrite(commandBuffer + CommandBufferSelfOffset, pointers);
+    }
+
+    private static void UpdateCommandBufferState(
+        ulong commandBuffer,
+        ulong buffer,
+        ulong size,
+        ulong writeOffset)
+    {
         var state = _commandBuffers.GetOrAdd(commandBuffer, static _ => new CommandBufferState());
         lock (state)
         {
@@ -511,15 +548,6 @@ public static class AmprExports
             state.Size = size;
             state.WriteOffset = writeOffset;
         }
-
-        return true;
-    }
-
-    private static bool WriteVisibleCommandBufferPointers(CpuContext ctx, ulong commandBuffer, ulong buffer, ulong size)
-    {
-        return ctx.TryWriteUInt64(commandBuffer + CommandBufferSelfOffset, commandBuffer) &&
-               ctx.TryWriteUInt64(commandBuffer + CommandBufferDataOffset, buffer) &&
-               ctx.TryWriteUInt64(commandBuffer + CommandBufferSizeOffset, size);
     }
 
     private static bool TryGetCommandBufferState(
@@ -540,9 +568,11 @@ public static class AmprExports
             return true;
         }
 
-        if (ctx.TryReadUInt64(commandBuffer + CommandBufferDataOffset, out buffer) &&
-            ctx.TryReadUInt64(commandBuffer + CommandBufferSizeOffset, out size))
+        Span<byte> pointers = stackalloc byte[sizeof(ulong) * 2];
+        if (ctx.Memory.TryRead(commandBuffer + CommandBufferDataOffset, pointers))
         {
+            buffer = BinaryPrimitives.ReadUInt64LittleEndian(pointers);
+            size = BinaryPrimitives.ReadUInt64LittleEndian(pointers[sizeof(ulong)..]);
             state = _commandBuffers.GetOrAdd(commandBuffer, static _ => new CommandBufferState());
             lock (state)
             {
