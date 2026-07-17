@@ -9,6 +9,7 @@ path = [
     "src/SharpEmu.GUI/Languages/**",
     "_logs/**",
     ".github/images/**",
+    ".github/pull_request_template.md",
     "assets/images/**"
 ]
 precedence = "aggregate"
